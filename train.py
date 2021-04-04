@@ -18,23 +18,24 @@ import os
 import random
 import time
 
-
+import pyprof
 import torch
 import numpy as np
-
+import torch.cuda.profiler as profiler
 import torch.distributed as dist
-
-
+from apex import amp
+from apex.parallel import DistributedDataParallel
 
 from common import helpers
-
+from common.dali.data_loader import DaliDataLoader
 from common.dataset import AudioDataset, get_data_loader
 from common.features import BaseFeatures, FilterbankFeatures
 from common.helpers import (Checkpointer, greedy_wer, num_weights, print_once,
                             process_evaluation_epoch)
+from common.optimizers import AdamW, lr_policy, Novograd
 from common.tb_dllogger import flush_log, init_log, log
 from jasper import config
-
+from jasper.model import CTCLossNM, GreedyCTCDecoder, Jasper
 
 
 def parse_args():
@@ -174,8 +175,14 @@ def evaluate(epoch, step, val_loader, val_feat_proc, labels, model,
 
 def main():
     args = parse_args()
-  
-    multi_gpu = 0
+
+    assert(torch.cuda.is_available())
+    assert args.prediction_frequency % args.log_frequency == 0
+
+    torch.backends.cudnn.benchmark = args.cudnn_benchmark
+
+    # set up distributed training
+    multi_gpu = int(os.environ.get('WORLD_SIZE', 1)) > 1
     if multi_gpu:
         torch.cuda.set_device(args.local_rank)
         dist.init_process_group(backend='nccl', init_method='env://')
@@ -188,8 +195,7 @@ def main():
     np.random.seed(args.seed + args.local_rank)
     random.seed(args.seed + args.local_rank)
 
-    #init_log(args)
-    print(args.model_config)
+    init_log(args)
 
     cfg = config.load(args.model_config)
     config.apply_duration_flags(cfg, args.max_duration, args.pad_to_max_duration)
@@ -203,7 +209,8 @@ def main():
     print_once('Setting up datasets...')
     train_dataset_kw, train_features_kw = config.input(cfg, 'train')
     val_dataset_kw, val_features_kw = config.input(cfg, 'val')
-    use_dali = False #args.dali_device in ('cpu', 'gpu')
+
+    use_dali = args.dali_device in ('cpu', 'gpu')
     if use_dali:
         assert train_dataset_kw['ignore_offline_speed_perturbation'], \
             "DALI doesn't support offline speed perturbation"
@@ -282,13 +289,213 @@ def main():
         dur = train_dataset.duration / 3600
         dur_f = train_dataset.duration_filtered / 3600
         nsampl = len(train_dataset)
-        #print_once(f'Training samples: {nsampl} ({dur:.1f}h, '
-        #           f'filtered {dur_f:.1f}h)')
-    #print(cfg)
-    
-    print("Done")
+        print_once(f'Training samples: {nsampl} ({dur:.1f}h, '
+                   f'filtered {dur_f:.1f}h)')
 
-   
+    if train_feat_proc is not None:
+        train_feat_proc.cuda()
+    if val_feat_proc is not None:
+        val_feat_proc.cuda()
+
+    steps_per_epoch = len(train_loader) // args.grad_accumulation_steps
+
+    # set up the model
+    model = Jasper(encoder_kw=config.encoder(cfg),
+                   decoder_kw=config.decoder(cfg, n_classes=len(symbols)))
+    model.cuda()
+    ctc_loss = CTCLossNM(n_classes=len(symbols))
+    greedy_decoder = GreedyCTCDecoder()
+
+    print_once(f'Model size: {num_weights(model) / 10**6:.1f}M params\n')
+
+    # optimization
+    kw = {'lr': args.lr, 'weight_decay': args.weight_decay}
+    if args.optimizer == "novograd":
+        optimizer = Novograd(model.parameters(), **kw)
+    elif args.optimizer == "adamw":
+        optimizer = AdamW(model.parameters(), **kw)
+    else:
+        raise ValueError(f'Invalid optimizer "{args.optimizer}"')
+
+    adjust_lr = lambda step, epoch, optimizer: lr_policy(
+        step, epoch, args.lr, optimizer, steps_per_epoch=steps_per_epoch,
+        warmup_epochs=args.warmup_epochs, hold_epochs=args.hold_epochs,
+        num_epochs=args.epochs, policy=args.lr_policy, min_lr=args.min_lr,
+        exp_gamma=args.lr_exp_gamma)
+
+    if args.amp:
+        model, optimizer = amp.initialize(
+            min_loss_scale=1.0, models=model, optimizers=optimizer,
+            opt_level='O1', max_loss_scale=512.0)
+
+    if args.ema > 0:
+        ema_model = copy.deepcopy(model)
+    else:
+        ema_model = None
+
+    if multi_gpu:
+        model = DistributedDataParallel(model)
+
+    if args.pyprof:
+        pyprof.init(enable_function_stack=True)
+
+    # load checkpoint
+    meta = {'best_wer': 10**6, 'start_epoch': 0}
+    checkpointer = Checkpointer(args.output_dir, 'Jasper',
+                                args.keep_milestones, args.amp)
+    if args.resume:
+        args.ckpt = checkpointer.last_checkpoint() or args.ckpt
+
+    if args.ckpt is not None:
+        checkpointer.load(args.ckpt, model, ema_model, optimizer, meta)
+
+    start_epoch = meta['start_epoch']
+    best_wer = meta['best_wer']
+    epoch = 1
+    step = start_epoch * steps_per_epoch + 1
+
+    if args.pyprof:
+        torch.autograd.profiler.emit_nvtx().__enter__()
+        profiler.start()
+
+    # training loop
+    model.train()
+
+    # pre-allocate
+    if args.pre_allocate_range is not None:
+        n_feats = train_features_kw['n_filt']
+        pad_align = train_features_kw['pad_align']
+        a, b = args.pre_allocate_range
+        for n_frames in range(a, b + pad_align, pad_align):
+            print_once(f'Pre-allocation ({batch_size}x{n_feats}x{n_frames})...')
+
+            feat = torch.randn(batch_size, n_feats, n_frames, device='cuda')
+            feat_lens = torch.ones(batch_size, device='cuda').fill_(n_frames)
+            txt = torch.randint(high=len(symbols)-1, size=(batch_size, 100),
+                                device='cuda')
+            txt_lens = torch.ones(batch_size, device='cuda').fill_(100)
+            log_probs, enc_lens = model(feat, feat_lens)
+            del feat
+            loss = ctc_loss(log_probs, txt, enc_lens, txt_lens)
+            loss.backward()
+            model.zero_grad()
+
+    for epoch in range(start_epoch + 1, args.epochs + 1):
+        if multi_gpu and not use_dali:
+            train_loader.sampler.set_epoch(epoch)
+
+        epoch_utts = 0
+        accumulated_batches = 0
+        epoch_start_time = time.time()
+
+        for batch in train_loader:
+
+            if accumulated_batches == 0:
+                adjust_lr(step, epoch, optimizer)
+                optimizer.zero_grad()
+                step_loss = 0
+                step_utts = 0
+                step_start_time = time.time()
+
+            if use_dali:
+                # with DALI, the data is already on GPU
+                feat, feat_lens, txt, txt_lens = batch
+                if train_feat_proc is not None:
+                    feat, feat_lens = train_feat_proc(feat, feat_lens, args.amp)
+            else:
+                batch = [t.cuda(non_blocking=True) for t in batch]
+                audio, audio_lens, txt, txt_lens = batch
+                feat, feat_lens = train_feat_proc(audio, audio_lens, args.amp)
+
+            log_probs, enc_lens = model(feat, feat_lens)
+
+            loss = ctc_loss(log_probs, txt, enc_lens, txt_lens)
+            loss /= args.grad_accumulation_steps
+
+            if torch.isnan(loss).any():
+                print_once(f'WARNING: loss is NaN; skipping update')
+            else:
+                if multi_gpu:
+                    step_loss += reduce_tensor(loss.data, world_size).item()
+                else:
+                    step_loss += loss.item()
+
+                if args.amp:
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                else:
+                    loss.backward()
+                step_utts += batch[0].size(0) * world_size
+                epoch_utts += batch[0].size(0) * world_size
+                accumulated_batches += 1
+
+            if accumulated_batches % args.grad_accumulation_steps == 0:
+                optimizer.step()
+                apply_ema(model, ema_model, args.ema)
+
+                if step % args.log_frequency == 0:
+                    preds = greedy_decoder(log_probs)
+                    wer, pred_utt, ref = greedy_wer(preds, txt, txt_lens, symbols)
+
+                    if step % args.prediction_frequency == 0:
+                        print_once(f'  Decoded:   {pred_utt[:90]}')
+                        print_once(f'  Reference: {ref[:90]}')
+
+                    step_time = time.time() - step_start_time
+                    log((epoch, step % steps_per_epoch or steps_per_epoch, steps_per_epoch),
+                        step, 'train',
+                        {'loss': step_loss,
+                         'wer': 100.0 * wer,
+                         'throughput': step_utts / step_time,
+                         'took': step_time,
+                         'lrate': optimizer.param_groups[0]['lr']})
+
+                step_start_time = time.time()
+
+                if step % args.eval_frequency == 0:
+                    wer = evaluate(epoch, step, val_loader, val_feat_proc,
+                                   symbols, model, ema_model, ctc_loss,
+                                   greedy_decoder, args.amp, use_dali)
+
+                    if wer < best_wer and epoch >= args.save_best_from:
+                        checkpointer.save(model, ema_model, optimizer, epoch,
+                                          step, best_wer, is_best=True)
+                        best_wer = wer
+
+                step += 1
+                accumulated_batches = 0
+                # end of step
+
+            # DALI iterator need to be exhausted;
+            # if not using DALI, simulate drop_last=True with grad accumulation
+            if not use_dali and step > steps_per_epoch * epoch:
+                break
+
+        epoch_time = time.time() - epoch_start_time
+        log((epoch,), None, 'train_avg', {'throughput': epoch_utts / epoch_time,
+                                          'took': epoch_time})
+
+        if epoch % args.save_frequency == 0 or epoch in args.keep_milestones:
+            checkpointer.save(model, ema_model, optimizer, epoch, step, best_wer)
+
+        if 0 < args.epochs_this_job <= epoch - start_epoch:
+            print_once(f'Finished after {args.epochs_this_job} epochs.')
+            break
+        # end of epoch
+
+    if args.pyprof:
+        profiler.stop()
+        torch.autograd.profiler.emit_nvtx().__exit__(None, None, None)
+
+    log((), None, 'train_avg', {'throughput': epoch_utts / epoch_time})
+
+    if epoch == args.epochs:
+        evaluate(epoch, step, val_loader, val_feat_proc, symbols, model,
+                 ema_model, ctc_loss, greedy_decoder, args.amp, use_dali)
+
+        checkpointer.save(model, ema_model, optimizer, epoch, step, best_wer)
+    flush_log()
+
 
 if __name__ == "__main__":
     main()
